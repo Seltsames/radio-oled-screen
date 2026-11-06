@@ -3,6 +3,7 @@
 // - Bluetooth audio receiver (A2DP) -> I2S -> MCU-PCM5102 DAC
 // - Song info from the phone (AVRCP): title, artist, duration, position, play/pause, volume
 // - 2.42" SSD1309 OLED: dot-matrix welcome sequence, then a now-playing screen
+// - Steering-wheel buttons (steering.cpp) and a settings menu (menu.cpp)
 //
 // Display wiring (OLED pin -> ESP32 GPIO):
 //   GND -> GND, VCC -> 3V3, SCK/D0 -> 18, SDA/D1 -> 23, RES -> 19, DC -> 21, CS -> 5
@@ -11,14 +12,11 @@
 // Steering wheel PCB (two resistor ladders):
 //   P1 -> GND, P4 -> GPIO 34 + 1 kOhm to 3V3, P5 -> GPIO 35 + 1 kOhm to 3V3,
 //   P2 (backlight +12 V) and P3 not connected
+// Setup button (opens the settings menu): GPIO 32 -> push button -> GND
 // (GPIO 16/17 are reserved for the UART link)
 
-#include <Arduino.h>
+#include "radio.h"
 #include <SPI.h>
-#include <U8g2lib.h>
-#include "AudioTools.h"
-#include "BluetoothA2DPSink.h"
-#include <Preferences.h>
 
 // ---------- Pins ----------
 #define PIN_SCK  18
@@ -31,14 +29,9 @@
 #define PIN_I2S_WS   25
 #define PIN_I2S_DATA 22
 
-#define BT_NAME "CITROEN RADIO"  // name the phone sees when pairing
-
 U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI u8g2(U8G2_R0, PIN_CS, PIN_DC, PIN_RST);
 I2SStream i2s;
 BluetoothA2DPSink a2dp(i2s);
-
-const int W = 128;
-const int H = 64;
 
 // ---------- Dot-matrix font (welcome sequence) ----------
 // Classic 5x7 character generator, ' ' to 'Z', one byte per dot column (bit 0 = top dot)
@@ -130,18 +123,6 @@ void drawBigCodes(int x, int y, const uint8_t *codes, int n) {
 }
 
 // ---------- Bluetooth state (written by the Bluetooth task, read by loop) ----------
-struct NowPlaying {
-  bool connected;
-  bool playing;
-  char title[128];
-  char artist[128];
-  char album[128];
-  uint32_t durationMs;
-  uint32_t posMs;       // position at posAt
-  unsigned long posAt;  // millis() when posMs was set
-  int volume;           // 0..127 (AVRCP absolute volume)
-};
-
 NowPlaying np;
 portMUX_TYPE npLock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -218,6 +199,28 @@ void startBluetooth() {
   np.volume = a2dp.get_volume();
 }
 
+void setVolume(int v) {
+  v = constrain(v, 0, 127);
+  muted = false;
+  a2dp.set_volume(v);
+  portENTER_CRITICAL(&npLock);
+  np.volume = v;
+  portEXIT_CRITICAL(&npLock);
+}
+
+// Sends the start volume from the settings shortly after a phone connects
+// (the phone reports its own volume right after connecting, so wait for that first)
+void applyStartVolume() {
+  static bool wasConnected = false;
+  static unsigned long connectedAt = 0;
+  if (np.connected && !wasConnected) connectedAt = millis();
+  wasConnected = np.connected;
+  if (connectedAt && millis() - connectedAt > 2000) {
+    connectedAt = 0;
+    if (settings.startVolume) setVolume(settings.startVolume * 127 / 100);
+  }
+}
+
 // ---------- Welcome ----------
 // Lit pixels switch off at random until the screen is empty
 void dissolve(int ms) {
@@ -234,7 +237,7 @@ void dissolve(int ms) {
 
 void welcome() {
   uint8_t codes[24];
-  const int y = (H - 13) / 2;  // vertically centered row
+  const int y = (VIEW_H - 13) / 2;  // vertically centered in the visible window
 
   // Chevron + CITROËN appears in the center one character at a time, then dissolves
   int n = toCodes("^ CITROËN", codes, 24);
@@ -261,30 +264,14 @@ void welcome() {
 }
 
 // ---------- Sources ----------
-// Only Bluetooth exists so far; the others are shown so the status bar can be tested
-enum Source { SRC_BT, SRC_FM, SRC_AM, SRC_TAPE, SRC_COUNT };
 const char *SOURCE_NAMES[] = {"BLUETOOTH", "RADIO FM", "RADIO AM", "CASSETTE"};
 Source source = SRC_BT;
 bool loud = false;
 bool muted = false;
 int volBeforeMute = 0;
 
-// Short message in the free area under the progress bar (button feedback)
-char toast[32];
-unsigned long toastUntil = 0;
-
-void showToast(const char *text) {
-  strlcpy(toast, text, sizeof(toast));
-  toastUntil = millis() + 1500;
-}
-
 // ---------- Main screen ----------
 // Layout: inverted status bar on top, then title, artist and playback strip spaced evenly
-const uint8_t *FONT_TITLE = u8g2_font_6x12_tf;   // LCD-style fonts with full Latin-1 accents
-const uint8_t *FONT_ARTIST = u8g2_font_5x7_tf;
-const uint8_t *FONT_SMALL = u8g2_font_4x6_tf;
-
-const int BAR_H = 11;
 const int TITLE_Y = 22;   // baselines: capitals span 13..21
 const int ARTIST_Y = 32;  // capitals span 26..31, 4 px below the title
 const int STRIP_Y = 36;   // progress bar rows 36..38, 4 px below the artist
@@ -432,6 +419,10 @@ void drawPlaybackStrip(const NowPlaying &s) {
 }
 
 void render() {
+  if (menuOpen()) {
+    drawMenu();
+    return;
+  }
   NowPlaying s;
   portENTER_CRITICAL(&npLock);
   s = np;
@@ -458,12 +449,6 @@ void render() {
   if (!waiting || (millis() / 600) % 2) drawScrolling(titleLine, TITLE_Y, FONT_TITLE);  // "EN ATTENTE" blinks
   drawScrolling(artistLine, ARTIST_Y, FONT_ARTIST);
   if (showPlayback) drawPlaybackStrip(s);
-  if (millis() < toastUntil) {
-    u8g2.setFont(FONT_ARTIST);
-    int w = u8g2.getUTF8Width(toast);
-    u8g2.drawRFrame((W - w) / 2 - 5, 46, w + 10, 12, 3);
-    u8g2.drawUTF8((W - w) / 2, 55, toast);
-  }
   u8g2.sendBuffer();
 }
 
@@ -484,8 +469,6 @@ void logChanges() {
   strlcpy(lastTitle, s.title, sizeof(lastTitle));
 }
 
-void loadSteering();
-
 void setup() {
   Serial.begin(115200);
   SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
@@ -493,226 +476,22 @@ void setup() {
   u8g2.begin();
   randomSeed(esp_random());
 
+  loadSettings();
+  applyBrightness();
   loadSteering();
+  setupMenuButton();
   startBluetooth();  // the phone can already connect during the welcome
   Serial.println("Bluetooth started as \"" BT_NAME "\"");
   welcome();
-}
 
-// ---------- Steering wheel buttons ----------
-// Two resistor ladders share P1 (ground). Each press pulls one line down to its own voltage
-// and the other line part of the way (they are linked by 666 Ohm on the PCB), so every button
-// has a unique (A, B) reading. Readings are learned once and stored in flash.
-#define PIN_SWC_A 34  // PCB P4: Vol-, Vol+, Select, Menu
-#define PIN_SWC_B 35  // PCB P5: Play/Pause, Prev, Next, Mute
-
-enum Action { ACT_NEXT, ACT_PREV, ACT_SELECT, ACT_MENU, ACT_VOL_UP, ACT_VOL_DOWN, ACT_PLAY_PAUSE, ACT_MUTE, NUM_ACTIONS };
-const char *ACTION_NAMES[] = {"SUIVANT", "PRÉCÉDENT", "SÉLECTION", "MENU", "VOLUME +", "VOLUME -", "LECTURE/PAUSE", "MUET"};
-
-struct SwcPoint {
-  uint16_t a, b;
-};
-
-SwcPoint swcTable[NUM_ACTIONS];
-bool swcReady = false;  // the buttons stay off until learned (unconnected inputs float)
-bool swcRawLog = false;
-
-const int SWC_IDLE = 3950;        // both lines above this = no button pressed
-const int SWC_MATCH = 400;        // max |dA| + |dB| from a learned point
-const int SWC_TOO_CLOSE = 300;    // learned points closer than this are reported
-const int SWC_STABLE = 4;         // samples (10 ms apart) before a press counts
-const int SWC_REPEAT_DELAY = 500; // volume repeats while held
-const int SWC_REPEAT_MS = 150;
-const int VOL_STEP = 8;           // of 127
-
-Preferences swcPrefs;
-
-void loadSteering() {
-  swcPrefs.begin("swc", true);
-  swcReady = swcPrefs.getBytesLength("table") == sizeof(swcTable) &&
-             swcPrefs.getBytes("table", swcTable, sizeof(swcTable)) == sizeof(swcTable);
-  swcPrefs.end();
-  Serial.println(swcReady ? "Steering wheel: learned buttons loaded" : "Steering wheel: not learned yet (send 'L')");
-}
-
-void saveSteering() {
-  swcPrefs.begin("swc", false);
-  swcPrefs.putBytes("table", swcTable, sizeof(swcTable));
-  swcPrefs.end();
-}
-
-SwcPoint readSwc() {
-  uint32_t a = 0, b = 0;
-  for (int i = 0; i < 4; i++) {
-    a += analogRead(PIN_SWC_A);
-    b += analogRead(PIN_SWC_B);
-  }
-  return {(uint16_t)(a / 4), (uint16_t)(b / 4)};
-}
-
-bool swcIdle(SwcPoint p) { return p.a > SWC_IDLE && p.b > SWC_IDLE; }
-int swcDistance(SwcPoint p, SwcPoint q) { return abs((int)p.a - q.a) + abs((int)p.b - q.b); }
-
-int matchSwc(SwcPoint p) {
-  int best = -1, bestDist = SWC_MATCH;
-  for (int i = 0; i < NUM_ACTIONS; i++) {
-    int d = swcDistance(p, swcTable[i]);
-    if (d < bestDist) { bestDist = d; best = i; }
-  }
-  return best;
-}
-
-void setVolume(int v) {
-  v = constrain(v, 0, 127);
-  muted = false;
-  a2dp.set_volume(v);
-  portENTER_CRITICAL(&npLock);
-  np.volume = v;
-  portEXIT_CRITICAL(&npLock);
-}
-
-void doAction(Action a) {
-  Serial.printf("Steering: %s\n", ACTION_NAMES[a]);
-  char msg[32];
-  switch (a) {
-    case ACT_NEXT: a2dp.next(); break;
-    case ACT_PREV: a2dp.previous(); break;
-    case ACT_PLAY_PAUSE:
-      if (np.playing) a2dp.pause();
-      else a2dp.play();
-      break;
-    case ACT_VOL_UP:
-    case ACT_VOL_DOWN:
-      setVolume(np.volume + (a == ACT_VOL_UP ? VOL_STEP : -VOL_STEP));
-      snprintf(msg, sizeof(msg), "VOLUME %d", np.volume * 100 / 127);
-      showToast(msg);
-      return;
-    case ACT_MUTE:
-      if (muted) {
-        setVolume(volBeforeMute);
-        showToast("SON ACTIVÉ");
-      } else {
-        volBeforeMute = np.volume;
-        a2dp.set_volume(0);
-        muted = true;
-        showToast("MUET");
-      }
-      return;
-    case ACT_SELECT:
-    case ACT_MENU:
-    default:
-      break;  // functions still to be decided
-  }
-  showToast(ACTION_NAMES[a]);
-}
-
-void pollSteering() {
-  static unsigned long lastSample = 0, lastRaw = 0, pressedAt = 0, lastRepeat = 0;
-  static int candidate = -1, count = 0, held = -1;
-  if (millis() - lastSample < 10) return;
-  lastSample = millis();
-
-  SwcPoint p = readSwc();
-  if (swcRawLog && millis() - lastRaw >= 100) {
-    lastRaw = millis();
-    Serial.printf("SWC A %4u  B %4u\n", p.a, p.b);
-  }
-  if (!swcReady) return;
-
-  int m = swcIdle(p) ? -1 : matchSwc(p);
-  if (m == candidate) count++;
-  else { candidate = m; count = 1; }
-  if (count < SWC_STABLE) return;
-
-  if (candidate != held) {
-    held = candidate;
-    if (held >= 0) {
-      doAction((Action)held);
-      pressedAt = lastRepeat = millis();
-    }
-  } else if ((held == ACT_VOL_UP || held == ACT_VOL_DOWN) && millis() - pressedAt > SWC_REPEAT_DELAY &&
-             millis() - lastRepeat > SWC_REPEAT_MS) {
-    doAction((Action)held);
-    lastRepeat = millis();
+  // First start with the wheel wired: learn the buttons right away
+  if (!swcReady && steeringWired()) {
+    Serial.println("Steering wheel detected but not learned: starting learn mode");
+    learnSteering();
   }
 }
 
-// ---------- Steering wheel learn mode ----------
-void drawLearn(int index, const char *hint, SwcPoint p) {
-  char buf[32];
-  u8g2.clearBuffer();
-  u8g2.drawBox(0, 0, W, BAR_H);
-  u8g2.setDrawColor(0);
-  u8g2.setFont(FONT_SMALL);
-  snprintf(buf, sizeof(buf), "APPRENTISSAGE %d/%d", index + 1, NUM_ACTIONS);
-  u8g2.drawStr(3, 8, buf);
-  u8g2.setDrawColor(1);
-  u8g2.setFont(FONT_ARTIST);
-  u8g2.drawUTF8((W - u8g2.getUTF8Width(hint)) / 2, 23, hint);
-  u8g2.setFont(FONT_TITLE);
-  u8g2.drawUTF8((W - u8g2.getUTF8Width(ACTION_NAMES[index])) / 2, 38, ACTION_NAMES[index]);
-  u8g2.setFont(FONT_SMALL);
-  snprintf(buf, sizeof(buf), "A %4u   B %4u", p.a, p.b);
-  u8g2.drawStr((W - u8g2.getStrWidth(buf)) / 2, 58, buf);
-  u8g2.sendBuffer();
-}
-
-// Waits until a button reading stays steady for 400 ms and returns its average
-SwcPoint waitSteadyPress(int index) {
-  SwcPoint ref = {0, 0};
-  unsigned long since = 0;
-  uint32_t sumA = 0, sumB = 0, n = 0;
-  while (true) {
-    SwcPoint p = readSwc();
-    drawLearn(index, "Appuyez et tenez", p);
-    if (swcIdle(p)) {
-      since = 0;
-    } else {
-      if (since == 0 || swcDistance(p, ref) > 60) {
-        ref = p;
-        since = millis();
-        sumA = sumB = n = 0;
-      }
-      sumA += p.a;
-      sumB += p.b;
-      n++;
-      if (millis() - since >= 400) return {(uint16_t)(sumA / n), (uint16_t)(sumB / n)};
-    }
-    delay(10);
-  }
-}
-
-void waitRelease(int index, SwcPoint learned) {
-  unsigned long idleSince = 0;
-  while (idleSince == 0 || millis() - idleSince < 200) {
-    SwcPoint p = readSwc();
-    drawLearn(index, "OK - relâchez", p);
-    if (!swcIdle(p)) idleSince = 0;
-    else if (idleSince == 0) idleSince = millis();
-    delay(10);
-  }
-}
-
-void learnSteering() {
-  Serial.println("\n=== Steering wheel learn mode: press and hold each button when asked ===");
-  SwcPoint learned[NUM_ACTIONS];
-  for (int i = 0; i < NUM_ACTIONS; i++) {
-    learned[i] = waitSteadyPress(i);
-    Serial.printf("%-14s A %4u  B %4u\n", ACTION_NAMES[i], learned[i].a, learned[i].b);
-    for (int k = 0; k < i; k++)
-      if (swcDistance(learned[i], learned[k]) < SWC_TOO_CLOSE)
-        Serial.printf("  WARNING: too close to %s (distance %d). Check the resistor mod on this button.\n",
-                      ACTION_NAMES[k], swcDistance(learned[i], learned[k]));
-    waitRelease(i, learned[i]);
-  }
-  memcpy(swcTable, learned, sizeof(swcTable));
-  saveSteering();
-  swcReady = true;
-  Serial.println("Steering wheel buttons saved");
-  showToast("BOUTONS ENREGISTRÉS");
-}
-
-// Test keys from the serial monitor
+// ---------- Serial test keys ----------
 void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -727,11 +506,12 @@ void handleSerial() {
     } else if (c == 'w') {
       swcRawLog = !swcRawLog;
     } else if (c == 'c') {
-      swcPrefs.begin("swc", false);
-      swcPrefs.clear();
-      swcPrefs.end();
-      swcReady = false;
+      clearSteering();
       Serial.println("Steering wheel buttons cleared (send 'L' to learn again)");
+    } else if (c >= '1' && c <= '8') {
+      pressButton(c - '1');  // simulates a steering-wheel button
+    } else if (c == 'm') {
+      menuShortPress();  // simulates a short press of the setup button
     }
   }
 }
@@ -740,6 +520,8 @@ void loop() {
   static unsigned long lastFrame = 0;
   handleSerial();
   pollSteering();
+  pollMenuButton();
+  applyStartVolume();
   if (millis() - lastFrame >= 25) {  // 40 FPS for smooth scrolling
     lastFrame = millis();
     render();
